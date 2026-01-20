@@ -1,0 +1,148 @@
+def find_cell_usage(self, lib_name: str, cell_name: str,
+                    target_cell: str, target_lib: str = None,
+                    view_name: str = "schematic", 
+                    max_depth: int = 20) -> List[str]:
+    """
+    특정 cell이 사용된 모든 hierarchy path 찾기
+    
+    Args:
+        lib_name: Top cell library
+        cell_name: Top cell name
+        target_cell: 찾을 cell 이름
+        target_lib: 찾을 cell의 library (None이면 이름만 매칭)
+        view_name: View 이름
+        max_depth: 최대 탐색 깊이
+        
+    Returns:
+        List of hierarchy paths
+        예: ["TOP/I_BUF", "TOP/I_CORE/I_BUF", "TOP/I_CORE/I_SUB/I_BUF"]
+    """
+    results: List[str] = []
+    self._find_cell_recursive(
+        lib_name, cell_name, view_name,
+        target_cell, target_lib,
+        cell_name, 0, max_depth, set(), results
+    )
+    return results
+
+
+def _find_cell_recursive(self, lib_name: str, cell_name: str, view_name: str,
+                         target_cell: str, target_lib: Optional[str],
+                         hier_path: str, depth: int, max_depth: int,
+                         visited: Set[str], results: List[str]) -> None:
+    if depth > max_depth:
+        return
+    
+    key = f"{lib_name}/{cell_name}"
+    if key in visited:
+        return
+    visited.add(key)
+    
+    cv = self._open_cv_internal(lib_name, cell_name, view_name)
+    if cv is None:
+        return
+    
+    instances = self._get_instances(cv)
+    self.ws.db.close(cv)
+    
+    for inst in instances:
+        new_hier = f"{hier_path}/{inst.name}"
+        
+        # 매칭 체크
+        cell_match = inst.cell_name == target_cell
+        lib_match = (target_lib is None) or (inst.lib_name == target_lib)
+        
+        if cell_match and lib_match:
+            results.append(new_hier)
+            print(f"  ✅ Found: {new_hier} ({inst.lib_name}/{inst.cell_name})")
+        
+        # 계속 탐색
+        self._find_cell_recursive(
+            inst.lib_name, inst.cell_name, view_name,
+            target_cell, target_lib,
+            new_hier, depth + 1, max_depth, visited.copy(), results
+        )
+
+
+def find_cell_usage_pattern(self, lib_name: str, cell_name: str,
+                            pattern: str,
+                            view_name: str = "schematic",
+                            max_depth: int = 20) -> List[dict]:
+    """
+    Cell 이름 패턴으로 찾기 (부분 매칭)
+    
+    Args:
+        lib_name: Top cell library
+        cell_name: Top cell name
+        pattern: 찾을 패턴 (예: "INV", "LATCH", "DFF")
+        
+    Returns:
+        List of {hier_path, cell, lib}
+    """
+    results: List[dict] = []
+    pattern_upper = pattern.upper()
+    
+    self._find_cell_pattern_recursive(
+        lib_name, cell_name, view_name,
+        pattern_upper,
+        cell_name, 0, max_depth, set(), results
+    )
+    return results
+
+
+def _find_cell_pattern_recursive(self, lib_name: str, cell_name: str, view_name: str,
+                                  pattern: str,
+                                  hier_path: str, depth: int, max_depth: int,
+                                  visited: Set[str], results: List[dict]) -> None:
+    if depth > max_depth:
+        return
+    
+    key = f"{lib_name}/{cell_name}"
+    if key in visited:
+        return
+    visited.add(key)
+    
+    cv = self._open_cv_internal(lib_name, cell_name, view_name)
+    if cv is None:
+        return
+    
+    instances = self._get_instances(cv)
+    self.ws.db.close(cv)
+    
+    for inst in instances:
+        new_hier = f"{hier_path}/{inst.name}"
+        
+        # 패턴 매칭
+        if pattern in inst.cell_name.upper():
+            results.append({
+                "hier_path": new_hier,
+                "cell": inst.cell_name,
+                "lib": inst.lib_name,
+                "instance": inst.name
+            })
+            print(f"  ✅ Found: {new_hier} ({inst.lib_name}/{inst.cell_name})")
+        
+        # 계속 탐색
+        self._find_cell_pattern_recursive(
+            inst.lib_name, inst.cell_name, view_name,
+            pattern,
+            new_hier, depth + 1, max_depth, visited.copy(), results
+        )
+
+
+def print_cell_usage(self, lib_name: str, cell_name: str,
+                     target_cell: str, target_lib: str = None) -> None:
+    """
+    특정 cell 사용 현황 출력
+    """
+    print(f"\n{'='*60}")
+    print(f"📍 '{target_cell}' 사용 현황 in {lib_name}/{cell_name}")
+    print('='*60 + "\n")
+    
+    paths = self.find_cell_usage(lib_name, cell_name, target_cell, target_lib)
+    
+    print(f"\n총 {len(paths)}개 발견:\n")
+    for p in paths:
+        print(f"  {p}")
+    
+    return paths
