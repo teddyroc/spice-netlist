@@ -1,355 +1,581 @@
 """
-Virtuoso Skillbridge Driver Finder (Python 3)
-1. CellView 기반 (단일 레벨)
-2. Hierarchy 기반 (전체 추적)
+Virtuoso Skillbridge Driver Finder
+Skillbridge를 사용하여 Virtuoso에서 library/cell의 driver를 찾는 기능
 """
 
 from skillbridge import Workspace
+from typing import List, Dict, Optional, Set
+from dataclasses import dataclass, field
+from enum import Enum
 
+
+# ============================================================
+# Data Classes
+# ============================================================
+
+class PinDirection(Enum):
+    INPUT = "input"
+    OUTPUT = "output"
+    INOUT = "inputOutput"
+
+
+@dataclass
+class Pin:
+    name: str
+    direction: PinDirection
+    net_name: Optional[str]
+
+
+@dataclass
+class Instance:
+    name: str
+    cell_name: str
+    lib_name: str
+    pins: List[Pin]
+
+
+@dataclass
+class Terminal:
+    name: str
+    direction: str
+    net_name: Optional[str]
+
+
+@dataclass
+class Driver:
+    instance: str
+    cell: str  # "lib/cell" 형태
+    pin: str
+    net: str
+
+
+@dataclass
+class Load:
+    instance: str
+    cell: str
+    pin: str
+    net: str
+
+
+@dataclass
+class CellViewInfo:
+    lib: str
+    cell: str
+    view: str
+    instances: List[Instance]
+    terminals: List[Terminal]
+    nets: List[str]
+
+
+@dataclass
+class HierNode:
+    hier_path: str  # "TOP/I_SUB/I_INV"
+    cell: str       # "lib/cell"
+    depth: int
+    instance: Optional[str] = None  # 자신의 instance 이름
+    children: List['HierNode'] = field(default_factory=list)
+    is_leaf: bool = True
+    note: Optional[str] = None
+
+
+@dataclass
+class DriverTrace:
+    hier_path: str
+    net: str
+    driver_inst: str
+    driver_cell: Optional[str]
+    driver_pin: Optional[str]
+    is_leaf: bool
+
+
+@dataclass
+class SequentialCell:
+    hier_path: str
+    cell: str
+    depth: int
+    d_pin: Optional[str] = None
+    d_net: Optional[str] = None
+    q_pin: Optional[str] = None
+    q_net: Optional[str] = None
+    clk_pin: Optional[str] = None
+    clk_net: Optional[str] = None
+
+
+@dataclass
+class TimingPaths:
+    startpoints: List[Dict]  # Q pins (launch)
+    endpoints: List[Dict]    # D pins (capture)
+
+
+# ============================================================
+# Main Class
+# ============================================================
 
 class VirtuosoDriver:
+    """Virtuoso Skillbridge 연결 및 Driver 탐색 클래스"""
     
-    def __init__(self, workspace_id="localhost"):
+    def __init__(self, workspace_id: str = "localhost"):
         try:
             self.ws = Workspace.open(workspace_id)
-            print("Virtuoso 연결 성공: %s" % workspace_id)
+            print(f"✅ Virtuoso 연결 성공: {workspace_id}")
         except Exception as e:
-            raise Exception("Virtuoso 연결 실패: %s" % e)
+            raise ConnectionError(f"❌ Virtuoso 연결 실패: {e}")
+        
+        self._open_cvs: Dict[str, any] = {}
     
     # ============================================================
-    # 공통 유틸리티
+    # CellView 컨트롤
     # ============================================================
     
-    def get_cellview(self, lib_name, cell_name, view_name="schematic"):
-        cv = self.ws.db.open_cell_view_by_type(
-            lib_name, cell_name, view_name, "", "r"
-        )
+    def open_cellview(self, lib_name: str, cell_name: str, 
+                      view_name: str = "schematic", mode: str = "r"):
+        """CellView 열기"""
+        key = f"{lib_name}/{cell_name}/{view_name}"
+        
+        if key in self._open_cvs:
+            return self._open_cvs[key]
+        
+        cv = self.ws.db.open_cell_view_by_type(lib_name, cell_name, view_name, "", mode)
+        
         if cv is None:
-            raise ValueError("CellView 없음: %s/%s/%s" % (lib_name, cell_name, view_name))
+            raise ValueError(f"❌ CellView 없음: {key}")
+        
+        self._open_cvs[key] = cv
+        print(f"✅ CellView 열림: {key}")
         return cv
     
-    def get_instances(self, cv):
-        """CellView의 인스턴스 목록"""
+    def close_cellview(self, cv) -> None:
+        """CellView 닫기"""
+        key = f"{cv.lib_name}/{cv.cell_name}/{cv.view_name}"
+        if key in self._open_cvs:
+            del self._open_cvs[key]
+        self.ws.db.close(cv)
+        print(f"✅ CellView 닫힘: {key}")
+    
+    def close_all_cellviews(self) -> None:
+        """열린 모든 CellView 닫기"""
+        for key, cv in list(self._open_cvs.items()):
+            self.ws.db.close(cv)
+            print(f"✅ CellView 닫힘: {key}")
+        self._open_cvs = {}
+    
+    def list_open_cellviews(self) -> List[str]:
+        """열린 CellView 목록"""
+        return list(self._open_cvs.keys())
+    
+    # ============================================================
+    # 내부 유틸리티
+    # ============================================================
+    
+    def _get_pin_direction(self, direction_str: str) -> PinDirection:
+        direction_map = {
+            "input": PinDirection.INPUT,
+            "output": PinDirection.OUTPUT,
+            "inputOutput": PinDirection.INOUT,
+            "inout": PinDirection.INOUT,
+        }
+        return direction_map.get(direction_str, PinDirection.INOUT)
+    
+    def _get_instances(self, cv) -> List[Instance]:
         instances = []
         for inst in cv.instances or []:
             pins = []
             for term in inst.inst_terms or []:
                 net = term.net
                 master_term = term.term
-                pins.append({
-                    "name": term.name,
-                    "direction": master_term.direction if master_term else "inputOutput",
-                    "net_name": net.name if net else None
-                })
-            instances.append({
-                "name": inst.name,
-                "cell_name": inst.cell_name,
-                "lib_name": inst.lib_name,
-                "pins": pins
-            })
+                direction = self._get_pin_direction(
+                    master_term.direction if master_term else "inputOutput"
+                )
+                pins.append(Pin(
+                    name=term.name,
+                    direction=direction,
+                    net_name=net.name if net else None
+                ))
+            instances.append(Instance(
+                name=inst.name,
+                cell_name=inst.cell_name,
+                lib_name=inst.lib_name,
+                pins=pins
+            ))
         return instances
     
-    def get_terminals(self, cv):
-        """CellView의 포트 목록"""
+    def _get_terminals(self, cv) -> List[Terminal]:
         terminals = []
         for term in cv.terminals or []:
             net = term.net
-            terminals.append({
-                "name": term.name,
-                "direction": term.direction,
-                "net_name": net.name if net else term.name
-            })
+            terminals.append(Terminal(
+                name=term.name,
+                direction=term.direction,
+                net_name=net.name if net else term.name
+            ))
         return terminals
     
-    def get_nets(self, cv):
-        """CellView의 Net 목록"""
-        nets = []
-        for net in cv.nets or []:
-            nets.append(net.name)
-        return nets
+    def _get_nets(self, cv) -> List[str]:
+        return [net.name for net in cv.nets or []]
+    
+    def _open_cv_internal(self, lib_name: str, cell_name: str, view_name: str):
+        """내부용 CV 열기 (관리 목록에 안 넣음)"""
+        return self.ws.db.open_cell_view_by_type(lib_name, cell_name, view_name, "", "r")
     
     # ============================================================
-    # 1. CellView 기반 (단일 레벨)
+    # CellView 기반 분석 (단일 레벨)
     # ============================================================
     
-    def cv_get_drivers(self, cv):
-        """
-        [CellView] 모든 Driver 찾기
-        
-        Returns:
-            List[dict]: driver 정보
-        """
+    def cv_get_info(self, cv) -> CellViewInfo:
+        """CellView 정보"""
+        return CellViewInfo(
+            lib=cv.lib_name,
+            cell=cv.cell_name,
+            view=cv.view_name,
+            instances=self._get_instances(cv),
+            terminals=self._get_terminals(cv),
+            nets=self._get_nets(cv)
+        )
+    
+    def cv_get_all_drivers(self, cv) -> List[Driver]:
+        """[CellView] 모든 Driver"""
         drivers = []
-        instances = self.get_instances(cv)
-        
-        for inst in instances:
-            for pin in inst["pins"]:
-                if pin["direction"] == "output" and pin["net_name"]:
-                    drivers.append({
-                        "instance": inst["name"],
-                        "cell": "%s/%s" % (inst["lib_name"], inst["cell_name"]),
-                        "pin": pin["name"],
-                        "net": pin["net_name"]
-                    })
+        for inst in self._get_instances(cv):
+            for pin in inst.pins:
+                if pin.direction == PinDirection.OUTPUT and pin.net_name:
+                    drivers.append(Driver(
+                        instance=inst.name,
+                        cell=f"{inst.lib_name}/{inst.cell_name}",
+                        pin=pin.name,
+                        net=pin.net_name
+                    ))
         return drivers
     
-    def cv_get_loads(self, cv):
-        """
-        [CellView] 모든 Load 찾기
-        
-        Returns:
-            List[dict]: load 정보
-        """
+    def cv_get_all_loads(self, cv) -> List[Load]:
+        """[CellView] 모든 Load"""
         loads = []
-        instances = self.get_instances(cv)
-        
-        for inst in instances:
-            for pin in inst["pins"]:
-                if pin["direction"] == "input" and pin["net_name"]:
-                    loads.append({
-                        "instance": inst["name"],
-                        "cell": "%s/%s" % (inst["lib_name"], inst["cell_name"]),
-                        "pin": pin["name"],
-                        "net": pin["net_name"]
-                    })
+        for inst in self._get_instances(cv):
+            for pin in inst.pins:
+                if pin.direction == PinDirection.INPUT and pin.net_name:
+                    loads.append(Load(
+                        instance=inst.name,
+                        cell=f"{inst.lib_name}/{inst.cell_name}",
+                        pin=pin.name,
+                        net=pin.net_name
+                    ))
         return loads
     
-    def cv_find_driver_for_net(self, cv, net_name):
-        """
-        [CellView] 특정 Net의 Driver 찾기
-        """
-        drivers = self.cv_get_drivers(cv)
-        return [d for d in drivers if d["net"] == net_name]
+    def cv_find_driver_for_net(self, cv, net_name: str) -> List[Driver]:
+        """[CellView] 특정 Net의 Driver"""
+        return [d for d in self.cv_get_all_drivers(cv) if d.net == net_name]
     
-    def cv_find_loads_for_net(self, cv, net_name):
-        """
-        [CellView] 특정 Net의 Load 찾기
-        """
-        loads = self.cv_get_loads(cv)
-        return [l for l in loads if l["net"] == net_name]
-    
-    def cv_get_info(self, cv):
-        """
-        [CellView] 기본 정보
-        """
-        instances = self.get_instances(cv)
-        terminals = self.get_terminals(cv)
-        nets = self.get_nets(cv)
-        
-        return {
-            "lib": cv.lib_name,
-            "cell": cv.cell_name,
-            "view": cv.view_name,
-            "num_instances": len(instances),
-            "num_terminals": len(terminals),
-            "num_nets": len(nets),
-            "instances": instances,
-            "terminals": terminals,
-            "nets": nets
-        }
+    def cv_find_loads_for_net(self, cv, net_name: str) -> List[Load]:
+        """[CellView] 특정 Net의 Load"""
+        return [l for l in self.cv_get_all_loads(cv) if l.net == net_name]
     
     # ============================================================
-    # 2. Hierarchy 기반 (전체 추적)
+    # Hierarchy 기반 분석
     # ============================================================
     
-    def hier_trace_driver(self, lib_name, cell_name, target_net,
-                          view_name="schematic", max_depth=20):
+    def hier_get_tree(self, lib_name: str, cell_name: str,
+                      view_name: str = "schematic", max_depth: int = 20) -> HierNode:
         """
-        [Hierarchy] Net의 Driver를 leaf cell까지 추적
+        [Hierarchy] 전체 트리 구조 (최상위부터)
+        """
+        return self._build_tree(lib_name, cell_name, view_name, cell_name, 0, max_depth, set())
+    
+    def _build_tree(self, lib_name: str, cell_name: str, view_name: str,
+                    hier_path: str, depth: int, max_depth: int, visited: Set[str]) -> HierNode:
+        key = f"{lib_name}/{cell_name}"
         
-        Args:
-            lib_name: 시작 Library
-            cell_name: 시작 Cell
-            target_net: 추적할 Net 이름
-            
-        Returns:
-            List[dict]: 각 결과에 hier_path 포함
-                - hier_path: "TOP/I_BUF/I_INV/MP0"
-                - driver_cell: "analogLib/pmos"
-                - driver_pin: "D"
-                - is_leaf: True/False
+        node = HierNode(
+            hier_path=hier_path,
+            cell=key,
+            depth=depth,
+            children=[],
+            is_leaf=True
+        )
+        
+        if depth > max_depth:
+            node.note = "max_depth"
+            return node
+        
+        if key in visited:
+            node.note = "already_visited"
+            return node
+        visited.add(key)
+        
+        cv = self._open_cv_internal(lib_name, cell_name, view_name)
+        if cv is None:
+            node.note = "no_schematic"
+            return node
+        
+        instances = self._get_instances(cv)
+        self.ws.db.close(cv)
+        
+        for inst in instances:
+            child_path = f"{hier_path}/{inst.name}"
+            child = self._build_tree(
+                inst.lib_name, inst.cell_name, view_name,
+                child_path, depth + 1, max_depth, visited.copy()
+            )
+            child.instance = inst.name
+            node.children.append(child)
+        
+        node.is_leaf = len(node.children) == 0
+        return node
+    
+    def hier_print_tree(self, node: HierNode, indent: int = 0) -> None:
+        """트리 출력"""
+        prefix = "  " * indent
+        name = node.instance if node.instance else node.hier_path
+        print(f"{prefix}{name} ({node.cell})")
+        for child in node.children:
+            self.hier_print_tree(child, indent + 1)
+    
+    def hier_flatten_tree(self, node: HierNode) -> List[HierNode]:
+        """트리를 flat list로"""
+        result = [node]
+        for child in node.children:
+            result.extend(self.hier_flatten_tree(child))
+        return result
+    
+    def hier_trace_driver(self, lib_name: str, cell_name: str, target_net: str,
+                          view_name: str = "schematic", max_depth: int = 20) -> List[DriverTrace]:
         """
-        results = []
-        self._trace_driver_recursive(
+        [Hierarchy] Net의 Driver를 leaf까지 추적
+        """
+        results: List[DriverTrace] = []
+        self._trace_driver(
             lib_name, cell_name, target_net, view_name,
-            cell_name,  # hier_path 시작
-            0, max_depth, set(), results
+            cell_name, 0, max_depth, set(), results
         )
         return results
     
-    def _trace_driver_recursive(self, lib_name, cell_name, target_net, view_name,
-                                 hier_path, depth, max_depth, visited, results):
-        """내부 재귀 함수"""
+    def _trace_driver(self, lib_name: str, cell_name: str, target_net: str, view_name: str,
+                      hier_path: str, depth: int, max_depth: int, 
+                      visited: Set[str], results: List[DriverTrace]) -> None:
         if depth > max_depth:
             return
         
-        visit_key = "%s|%s|%s" % (hier_path, lib_name, target_net)
+        visit_key = f"{hier_path}|{target_net}"
         if visit_key in visited:
             return
         visited.add(visit_key)
         
         indent = "  " * depth
         
-        try:
-            cv = self.get_cellview(lib_name, cell_name, view_name)
-        except:
-            results.append({
-                "hier_path": hier_path,
-                "net": target_net,
-                "driver_inst": "(NO_SCHEMATIC)",
-                "driver_cell": "%s/%s" % (lib_name, cell_name),
-                "driver_pin": None,
-                "is_leaf": True
-            })
+        cv = self._open_cv_internal(lib_name, cell_name, view_name)
+        if cv is None:
+            results.append(DriverTrace(
+                hier_path=hier_path,
+                net=target_net,
+                driver_inst="(NO_SCHEMATIC)",
+                driver_cell=f"{lib_name}/{cell_name}",
+                driver_pin=None,
+                is_leaf=True
+            ))
             return
         
-        instances = self.get_instances(cv)
-        terminals = self.get_terminals(cv)
+        instances = self._get_instances(cv)
+        terminals = self._get_terminals(cv)
+        self.ws.db.close(cv)
         
-        print("%s[%d] %s : net '%s'" % (indent, depth, hier_path, target_net))
+        print(f"{indent}[{depth}] {hier_path} : net '{target_net}'")
         
         found = False
         for inst in instances:
-            for pin in inst["pins"]:
-                if pin["net_name"] == target_net and pin["direction"] == "output":
+            for pin in inst.pins:
+                if pin.net_name == target_net and pin.direction == PinDirection.OUTPUT:
                     found = True
-                    new_hier = "%s/%s" % (hier_path, inst["name"])
+                    new_hier = f"{hier_path}/{inst.name}"
                     
-                    print("%s     Driver: %s (%s/%s).%s" % (
-                        indent, inst["name"], inst["lib_name"], inst["cell_name"], pin["name"]
-                    ))
+                    print(f"{indent}     Driver: {inst.name} ({inst.lib_name}/{inst.cell_name}).{pin.name}")
                     
-                    # Subcell로 내려가기
-                    try:
-                        sub_cv = self.get_cellview(inst["lib_name"], inst["cell_name"], view_name)
-                        sub_terms = self.get_terminals(sub_cv)
+                    # Subcell 내부로
+                    sub_cv = self._open_cv_internal(inst.lib_name, inst.cell_name, view_name)
+                    if sub_cv:
+                        sub_terms = self._get_terminals(sub_cv)
+                        self.ws.db.close(sub_cv)
                         
                         internal_net = None
                         for t in sub_terms:
-                            if t["name"] == pin["name"]:
-                                internal_net = t["net_name"]
+                            if t.name == pin.name:
+                                internal_net = t.net_name
                                 break
                         
-                        self.ws.db.close(sub_cv)
-                        
                         if internal_net:
-                            self._trace_driver_recursive(
-                                inst["lib_name"], inst["cell_name"], internal_net, view_name,
+                            self._trace_driver(
+                                inst.lib_name, inst.cell_name, internal_net, view_name,
                                 new_hier, depth + 1, max_depth, visited, results
                             )
                         else:
-                            results.append({
-                                "hier_path": new_hier,
-                                "net": target_net,
-                                "driver_inst": inst["name"],
-                                "driver_cell": "%s/%s" % (inst["lib_name"], inst["cell_name"]),
-                                "driver_pin": pin["name"],
-                                "is_leaf": True
-                            })
-                    except:
-                        # Primitive cell
-                        print("%s     [LEAF] primitive" % indent)
-                        results.append({
-                            "hier_path": new_hier,
-                            "net": target_net,
-                            "driver_inst": inst["name"],
-                            "driver_cell": "%s/%s" % (inst["lib_name"], inst["cell_name"]),
-                            "driver_pin": pin["name"],
-                            "is_leaf": True
-                        })
+                            results.append(DriverTrace(
+                                hier_path=new_hier,
+                                net=target_net,
+                                driver_inst=inst.name,
+                                driver_cell=f"{inst.lib_name}/{inst.cell_name}",
+                                driver_pin=pin.name,
+                                is_leaf=True
+                            ))
+                    else:
+                        print(f"{indent}     [LEAF]")
+                        results.append(DriverTrace(
+                            hier_path=new_hier,
+                            net=target_net,
+                            driver_inst=inst.name,
+                            driver_cell=f"{inst.lib_name}/{inst.cell_name}",
+                            driver_pin=pin.name,
+                            is_leaf=True
+                        ))
         
         if not found:
-            # Input port 체크
             for t in terminals:
-                if t["net_name"] == target_net and t["direction"] == "input":
-                    print("%s     [INPUT PORT] %s" % (indent, t["name"]))
-                    results.append({
-                        "hier_path": hier_path,
-                        "net": target_net,
-                        "driver_inst": "(INPUT_PORT)",
-                        "driver_cell": None,
-                        "driver_pin": t["name"],
-                        "is_leaf": True
-                    })
+                if t.net_name == target_net and t.direction == "input":
+                    print(f"{indent}     [INPUT PORT] {t.name}")
+                    results.append(DriverTrace(
+                        hier_path=hier_path,
+                        net=target_net,
+                        driver_inst="(INPUT_PORT)",
+                        driver_cell=None,
+                        driver_pin=t.name,
+                        is_leaf=True
+                    ))
                     break
-        
-        self.ws.db.close(cv)
     
-    def hier_get_tree(self, lib_name, cell_name, view_name="schematic", max_depth=20):
+    # ============================================================
+    # Sequential Cell 찾기 (Hierarchy 전체)
+    # ============================================================
+    
+    def hier_find_sequential_by_pins(self, lib_name: str, cell_name: str,
+                                     view_name: str = "schematic",
+                                     max_depth: int = 20) -> List[SequentialCell]:
         """
-        [Hierarchy] 전체 트리 구조 가져오기
+        [Hierarchy] Pin 구조로 Sequential 찾기 (CLK + D + Q)
+        """
+        clk_names = {"CLK", "CK", "CP", "CLOCK", "G", "GATE", "EN"}
+        d_names = {"D", "DN", "D_N", "DATA", "DI"}
+        q_names = {"Q", "QN", "Q_N", "QB", "DO", "OUT"}
         
-        Returns:
-            Dict: nested 구조
-        """
-        return self._get_tree_recursive(
+        results: List[SequentialCell] = []
+        self._find_seq_by_pins(
             lib_name, cell_name, view_name,
-            cell_name, 0, max_depth, set()
+            cell_name, 0, max_depth, set(),
+            clk_names, d_names, q_names, results
         )
+        return results
     
-    def _get_tree_recursive(self, lib_name, cell_name, view_name,
-                            hier_path, depth, max_depth, visited):
-        """내부 재귀 함수"""
+    def _find_seq_by_pins(self, lib_name: str, cell_name: str, view_name: str,
+                          hier_path: str, depth: int, max_depth: int, visited: Set[str],
+                          clk_names: Set[str], d_names: Set[str], q_names: Set[str],
+                          results: List[SequentialCell]) -> None:
         if depth > max_depth:
-            return {
-                "hier_path": hier_path,
-                "cell": "%s/%s" % (lib_name, cell_name),
-                "children": [],
-                "is_leaf": True
-            }
+            return
         
-        key = "%s/%s" % (lib_name, cell_name)
+        key = f"{lib_name}/{cell_name}"
         if key in visited:
-            return {
-                "hier_path": hier_path,
-                "cell": key,
-                "children": [],
-                "is_leaf": True,
-                "note": "already_visited"
-            }
+            return
         visited.add(key)
         
-        try:
-            cv = self.get_cellview(lib_name, cell_name, view_name)
-        except:
-            return {
-                "hier_path": hier_path,
-                "cell": key,
-                "children": [],
-                "is_leaf": True,
-                "note": "no_schematic"
-            }
+        cv = self._open_cv_internal(lib_name, cell_name, view_name)
+        if cv is None:
+            return
         
-        instances = self.get_instances(cv)
+        instances = self._get_instances(cv)
         self.ws.db.close(cv)
         
-        children = []
         for inst in instances:
-            child_path = "%s/%s" % (hier_path, inst["name"])
-            child = self._get_tree_recursive(
-                inst["lib_name"], inst["cell_name"], view_name,
-                child_path, depth + 1, max_depth, visited.copy()
-            )
-            child["instance"] = inst["name"]
-            children.append(child)
+            new_hier = f"{hier_path}/{inst.name}"
+            pin_names = {p.name.upper() for p in inst.pins}
+            
+            has_clk = bool(pin_names & clk_names)
+            has_d = bool(pin_names & d_names)
+            has_q = bool(pin_names & q_names)
+            
+            if has_clk and has_d and has_q:
+                seq = SequentialCell(
+                    hier_path=new_hier,
+                    cell=f"{inst.lib_name}/{inst.cell_name}",
+                    depth=depth + 1
+                )
+                
+                for p in inst.pins:
+                    pu = p.name.upper()
+                    if pu in d_names:
+                        seq.d_pin = p.name
+                        seq.d_net = p.net_name
+                    elif pu in q_names:
+                        seq.q_pin = p.name
+                        seq.q_net = p.net_name
+                    elif pu in clk_names:
+                        seq.clk_pin = p.name
+                        seq.clk_net = p.net_name
+                
+                results.append(seq)
+            else:
+                self._find_seq_by_pins(
+                    inst.lib_name, inst.cell_name, view_name,
+                    new_hier, depth + 1, max_depth, visited.copy(),
+                    clk_names, d_names, q_names, results
+                )
+    
+    def hier_find_sequential_by_name(self, lib_name: str, cell_name: str,
+                                     view_name: str = "schematic",
+                                     patterns: Optional[List[str]] = None,
+                                     max_depth: int = 20) -> List[HierNode]:
+        """
+        [Hierarchy] Cell 이름 패턴으로 Sequential 찾기
+        """
+        if patterns is None:
+            patterns = ["LATCH", "LAT", "DFF", "SDFF", "MSFF", "FD", "FF"]
         
-        return {
-            "hier_path": hier_path,
-            "cell": key,
-            "children": children,
-            "is_leaf": len(children) == 0
-        }
+        tree = self.hier_get_tree(lib_name, cell_name, view_name, max_depth)
+        flat = self.hier_flatten_tree(tree)
+        
+        results = []
+        for node in flat:
+            cell_upper = node.cell.upper()
+            for pat in patterns:
+                if pat.upper() in cell_upper:
+                    results.append(node)
+                    break
+        
+        return results
     
-    def hier_print_tree(self, tree, indent=0):
-        """트리 출력"""
-        prefix = "  " * indent
-        name = tree["hier_path"].split("/")[-1]
-        print("%s%s (%s)" % (prefix, name, tree["cell"]))
-        for child in tree.get("children", []):
-            self.hier_print_tree(child, indent + 1)
+    def hier_get_timing_paths(self, lib_name: str, cell_name: str,
+                              view_name: str = "schematic",
+                              max_depth: int = 20) -> TimingPaths:
+        """
+        [Hierarchy] Setup/Hold 체크 필요한 Timing path 찾기
+        """
+        seq_cells = self.hier_find_sequential_by_pins(lib_name, cell_name, view_name, max_depth)
+        
+        startpoints = []
+        endpoints = []
+        
+        for seq in seq_cells:
+            if seq.q_net:
+                startpoints.append({
+                    "hier_path": seq.hier_path,
+                    "cell": seq.cell,
+                    "pin": seq.q_pin,
+                    "net": seq.q_net,
+                    "clk_net": seq.clk_net
+                })
+            
+            if seq.d_net:
+                endpoints.append({
+                    "hier_path": seq.hier_path,
+                    "cell": seq.cell,
+                    "pin": seq.d_pin,
+                    "net": seq.d_net,
+                    "clk_net": seq.clk_net
+                })
+        
+        return TimingPaths(startpoints=startpoints, endpoints=endpoints)
     
-    def close(self):
-        print("Virtuoso 연결 종료")
+    # ============================================================
+    # 종료
+    # ============================================================
+    
+    def close(self) -> None:
+        self.close_all_cellviews()
+        print("✅ Virtuoso 연결 종료")
 
 
 # ============================================================
@@ -362,57 +588,57 @@ if __name__ == "__main__":
     lib_name = "myLib"
     cell_name = "TOP"
     
-    # ========================================
-    # 1. CellView 기반 (단일 레벨)
-    # ========================================
+    # 1. CellView 기반
     print("\n" + "="*60)
-    print("1. CellView 기반")
+    print("1. CellView 기반 분석")
     print("="*60)
     
-    cv = vd.get_cellview(lib_name, cell_name)
-    
-    # 정보
+    cv = vd.open_cellview(lib_name, cell_name)
     info = vd.cv_get_info(cv)
-    print("Instances: %d, Nets: %d, Ports: %d" % (
-        info["num_instances"], info["num_nets"], info["num_terminals"]
-    ))
+    print(f"Instances: {len(info.instances)}, Nets: {len(info.nets)}, Ports: {len(info.terminals)}")
     
-    # 특정 Net의 Driver
     net_name = "OUT"
     drivers = vd.cv_find_driver_for_net(cv, net_name)
-    print("\nNet '%s' drivers:" % net_name)
     for d in drivers:
-        print("  %s (%s).%s" % (d["instance"], d["cell"], d["pin"]))
+        print(f"  Driver: {d.instance} ({d.cell}).{d.pin}")
     
-    # 특정 Net의 Load
-    loads = vd.cv_find_loads_for_net(cv, net_name)
-    print("\nNet '%s' loads:" % net_name)
-    for l in loads:
-        print("  %s (%s).%s" % (l["instance"], l["cell"], l["pin"]))
-    
-    vd.ws.db.close(cv)
-    
-    # ========================================
-    # 2. Hierarchy 기반 (전체 추적)
-    # ========================================
+    # 2. Hierarchy Tree
     print("\n" + "="*60)
-    print("2. Hierarchy 기반 Driver 추적")
-    print("="*60 + "\n")
-    
-    results = vd.hier_trace_driver(lib_name, cell_name, "OUT")
-    
-    print("\n--- Results ---")
-    for r in results:
-        print("  %s -> %s.%s" % (r["hier_path"], r["driver_cell"], r["driver_pin"]))
-    
-    # ========================================
-    # 3. Hierarchy Tree
-    # ========================================
-    print("\n" + "="*60)
-    print("3. Hierarchy Tree")
+    print("2. Hierarchy Tree")
     print("="*60 + "\n")
     
     tree = vd.hier_get_tree(lib_name, cell_name)
     vd.hier_print_tree(tree)
+    
+    # 3. Driver 추적
+    print("\n" + "="*60)
+    print(f"3. Driver 추적: Net '{net_name}'")
+    print("="*60 + "\n")
+    
+    traces = vd.hier_trace_driver(lib_name, cell_name, net_name)
+    print("\n--- Leaf Drivers ---")
+    for t in traces:
+        print(f"  {t.hier_path} -> {t.driver_cell}.{t.driver_pin}")
+    
+    # 4. Sequential 찾기
+    print("\n" + "="*60)
+    print("4. Sequential Cells")
+    print("="*60)
+    
+    seq_cells = vd.hier_find_sequential_by_pins(lib_name, cell_name)
+    for seq in seq_cells:
+        print(f"  {seq.hier_path} ({seq.cell})")
+        print(f"    D: {seq.d_pin} -> {seq.d_net}")
+        print(f"    Q: {seq.q_pin} -> {seq.q_net}")
+        print(f"    CLK: {seq.clk_pin} -> {seq.clk_net}")
+    
+    # 5. Timing Paths
+    print("\n" + "="*60)
+    print("5. Timing Paths")
+    print("="*60)
+    
+    timing = vd.hier_get_timing_paths(lib_name, cell_name)
+    print(f"\nStartpoints: {len(timing.startpoints)}")
+    print(f"Endpoints: {len(timing.endpoints)}")
     
     vd.close()
