@@ -1,0 +1,470 @@
+"""
+Virtuoso Skillbridge Driver Finder
+Skillbridge를 사용하여 Virtuoso에서 library/cell의 driver를 찾는 기능
+"""
+
+from skillbridge import Workspace
+from typing import List, Dict, Optional, Set, Tuple
+from dataclasses import dataclass
+from enum import Enum
+
+
+class PinDirection(Enum):
+    INPUT = "input"
+    OUTPUT = "output"
+    INOUT = "inputOutput"
+
+
+@dataclass
+class Pin:
+    name: str
+    direction: PinDirection
+    net_name: str
+    
+
+@dataclass
+class Instance:
+    name: str
+    cell_name: str
+    lib_name: str
+    pins: List[Pin]
+    
+
+@dataclass
+class Driver:
+    instance_name: str
+    cell_name: str
+    lib_name: str
+    output_pin: str
+    driven_net: str
+
+
+class VirtuosoDriver:
+    """Virtuoso Skillbridge 연결 및 Driver 탐색 클래스"""
+    
+    def __init__(self, workspace_id: str = "localhost"):
+        """
+        Skillbridge 연결 초기화
+        
+        Args:
+            workspace_id: Virtuoso workspace ID (기본값: localhost)
+        """
+        try:
+            self.ws = Workspace.open(workspace_id)
+            print(f"✅ Virtuoso 연결 성공: {workspace_id}")
+        except Exception as e:
+            raise ConnectionError(f"❌ Virtuoso 연결 실패: {e}")
+    
+    def get_cellview(self, lib_name: str, cell_name: str, view_name: str = "schematic"):
+        """
+        CellView 열기
+        
+        Args:
+            lib_name: Library 이름
+            cell_name: Cell 이름
+            view_name: View 이름 (기본값: schematic)
+            
+        Returns:
+            CellView 객체
+        """
+        cv = self.ws.db.open_cell_view_by_type(
+            lib_name, 
+            cell_name, 
+            view_name, 
+            "", 
+            "r"  # read mode
+        )
+        
+        if cv is None:
+            raise ValueError(f"❌ CellView를 찾을 수 없음: {lib_name}/{cell_name}/{view_name}")
+        
+        print(f"✅ CellView 열림: {lib_name}/{cell_name}/{view_name}")
+        return cv
+    
+    def get_all_instances(self, cv) -> List[Instance]:
+        """
+        CellView의 모든 인스턴스 가져오기
+        
+        Args:
+            cv: CellView 객체
+            
+        Returns:
+            Instance 리스트
+        """
+        instances = []
+        
+        for inst in cv.instances or []:
+            inst_name = inst.name
+            inst_cell_name = inst.cell_name
+            inst_lib_name = inst.lib_name
+            
+            pins = []
+            for term in inst.inst_terms or []:
+                pin_name = term.name
+                net = term.net
+                net_name = net.name if net else None
+                
+                # Pin direction 가져오기
+                master_term = term.term
+                if master_term:
+                    direction = self._get_pin_direction(master_term.direction)
+                else:
+                    direction = PinDirection.INOUT
+                
+                pins.append(Pin(
+                    name=pin_name,
+                    direction=direction,
+                    net_name=net_name
+                ))
+            
+            instances.append(Instance(
+                name=inst_name,
+                cell_name=inst_cell_name,
+                lib_name=inst_lib_name,
+                pins=pins
+            ))
+        
+        return instances
+    
+    def _get_pin_direction(self, direction_str: str) -> PinDirection:
+        """Direction 문자열을 Enum으로 변환"""
+        direction_map = {
+            "input": PinDirection.INPUT,
+            "output": PinDirection.OUTPUT,
+            "inputOutput": PinDirection.INOUT,
+            "inout": PinDirection.INOUT,
+        }
+        return direction_map.get(direction_str, PinDirection.INOUT)
+    
+    def get_all_nets(self, cv) -> Dict[str, List[str]]:
+        """
+        CellView의 모든 Net과 연결된 핀들 가져오기
+        
+        Args:
+            cv: CellView 객체
+            
+        Returns:
+            {net_name: [연결된 핀들]} 딕셔너리
+        """
+        nets = {}
+        
+        for net in cv.nets or []:
+            net_name = net.name
+            connected_pins = []
+            
+            # Net에 연결된 instance terminal들
+            for inst_term in net.inst_terms or []:
+                inst_name = inst_term.inst.name
+                pin_name = inst_term.name
+                connected_pins.append(f"{inst_name}/{pin_name}")
+            
+            # Net에 연결된 top-level terminal들
+            for term in net.terms or []:
+                connected_pins.append(f"(PORT){term.name}")
+            
+            nets[net_name] = connected_pins
+        
+        return nets
+    
+    def find_drivers(self, lib_name: str, cell_name: str, 
+                     view_name: str = "schematic") -> List[Driver]:
+        """
+        특정 Cell의 모든 Driver 찾기
+        
+        Driver = Output 핀을 가진 인스턴스
+        
+        Args:
+            lib_name: Library 이름
+            cell_name: Cell 이름
+            view_name: View 이름
+            
+        Returns:
+            Driver 리스트
+        """
+        cv = self.get_cellview(lib_name, cell_name, view_name)
+        instances = self.get_all_instances(cv)
+        
+        drivers = []
+        
+        for inst in instances:
+            for pin in inst.pins:
+                if pin.direction == PinDirection.OUTPUT:
+                    drivers.append(Driver(
+                        instance_name=inst.name,
+                        cell_name=inst.cell_name,
+                        lib_name=inst.lib_name,
+                        output_pin=pin.name,
+                        driven_net=pin.net_name
+                    ))
+        
+        # CellView 닫기
+        self.ws.db.close(cv)
+        
+        return drivers
+    
+    def find_drivers_for_net(self, lib_name: str, cell_name: str, 
+                             target_net: str,
+                             view_name: str = "schematic") -> List[Driver]:
+        """
+        특정 Net을 드라이브하는 인스턴스 찾기
+        
+        Args:
+            lib_name: Library 이름
+            cell_name: Cell 이름
+            target_net: 찾을 Net 이름
+            view_name: View 이름
+            
+        Returns:
+            해당 Net을 드라이브하는 Driver 리스트
+        """
+        all_drivers = self.find_drivers(lib_name, cell_name, view_name)
+        
+        return [d for d in all_drivers if d.driven_net == target_net]
+    
+    def find_loads_for_net(self, lib_name: str, cell_name: str,
+                           target_net: str,
+                           view_name: str = "schematic") -> List[Dict]:
+        """
+        특정 Net의 Load(입력으로 받는 인스턴스) 찾기
+        
+        Args:
+            lib_name: Library 이름
+            cell_name: Cell 이름
+            target_net: 찾을 Net 이름
+            view_name: View 이름
+            
+        Returns:
+            Load 정보 리스트
+        """
+        cv = self.get_cellview(lib_name, cell_name, view_name)
+        instances = self.get_all_instances(cv)
+        
+        loads = []
+        
+        for inst in instances:
+            for pin in inst.pins:
+                if pin.net_name == target_net and pin.direction == PinDirection.INPUT:
+                    loads.append({
+                        "instance_name": inst.name,
+                        "cell_name": inst.cell_name,
+                        "lib_name": inst.lib_name,
+                        "input_pin": pin.name
+                    })
+        
+        self.ws.db.close(cv)
+        
+        return loads
+    
+    def trace_signal_path(self, lib_name: str, cell_name: str,
+                          start_net: str, 
+                          max_depth: int = 10,
+                          view_name: str = "schematic") -> List[Dict]:
+        """
+        신호 경로 추적 (Driver → Load → Driver → ...)
+        
+        Args:
+            lib_name: Library 이름
+            cell_name: Cell 이름
+            start_net: 시작 Net 이름
+            max_depth: 최대 추적 깊이
+            view_name: View 이름
+            
+        Returns:
+            신호 경로 리스트
+        """
+        cv = self.get_cellview(lib_name, cell_name, view_name)
+        instances = self.get_all_instances(cv)
+        
+        # Instance별 핀 매핑 생성
+        inst_map = {inst.name: inst for inst in instances}
+        
+        path = []
+        visited_nets = set()
+        current_net = start_net
+        
+        for depth in range(max_depth):
+            if current_net in visited_nets:
+                break
+            visited_nets.add(current_net)
+            
+            # 현재 net의 driver 찾기
+            driver = None
+            for inst in instances:
+                for pin in inst.pins:
+                    if pin.net_name == current_net and pin.direction == PinDirection.OUTPUT:
+                        driver = {
+                            "depth": depth,
+                            "net": current_net,
+                            "driver_inst": inst.name,
+                            "driver_cell": inst.cell_name,
+                            "driver_pin": pin.name
+                        }
+                        break
+                if driver:
+                    break
+            
+            if driver:
+                path.append(driver)
+                
+                # Driver 인스턴스의 입력 net 찾기 (다음 추적 대상)
+                driver_inst = inst_map.get(driver["driver_inst"])
+                if driver_inst:
+                    input_nets = [p.net_name for p in driver_inst.pins 
+                                  if p.direction == PinDirection.INPUT and p.net_name]
+                    if input_nets:
+                        current_net = input_nets[0]  # 첫 번째 입력으로 계속 추적
+                    else:
+                        break
+                else:
+                    break
+            else:
+                # Driver가 없으면 (아마도 입력 포트)
+                path.append({
+                    "depth": depth,
+                    "net": current_net,
+                    "driver_inst": "(INPUT PORT)",
+                    "driver_cell": None,
+                    "driver_pin": None
+                })
+                break
+        
+        self.ws.db.close(cv)
+        
+        return path
+    
+    def get_hierarchy_info(self, lib_name: str, cell_name: str,
+                           view_name: str = "schematic") -> Dict:
+        """
+        Cell의 계층 구조 정보 가져오기
+        
+        Args:
+            lib_name: Library 이름
+            cell_name: Cell 이름
+            view_name: View 이름
+            
+        Returns:
+            계층 구조 정보 딕셔너리
+        """
+        cv = self.get_cellview(lib_name, cell_name, view_name)
+        instances = self.get_all_instances(cv)
+        
+        # 사용된 Cell 타입별 카운트
+        cell_usage = {}
+        for inst in instances:
+            key = f"{inst.lib_name}/{inst.cell_name}"
+            cell_usage[key] = cell_usage.get(key, 0) + 1
+        
+        # Net 정보
+        nets = self.get_all_nets(cv)
+        
+        # Top-level 포트 정보
+        ports = []
+        for term in cv.terminals or []:
+            ports.append({
+                "name": term.name,
+                "direction": str(term.direction)
+            })
+        
+        self.ws.db.close(cv)
+        
+        return {
+            "lib_name": lib_name,
+            "cell_name": cell_name,
+            "view_name": view_name,
+            "instance_count": len(instances),
+            "net_count": len(nets),
+            "port_count": len(ports),
+            "cell_usage": cell_usage,
+            "ports": ports
+        }
+    
+    def close(self):
+        """연결 종료"""
+        # Skillbridge는 명시적 close가 필요 없지만, 정리 작업이 필요하면 여기서
+        print("✅ Virtuoso 연결 종료")
+
+
+# ============================================================
+# 사용 예시
+# ============================================================
+
+def main():
+    """사용 예시"""
+    
+    # 1. Virtuoso 연결
+    # Virtuoso가 실행 중이고 skillbridge server가 켜져 있어야 함
+    # Virtuoso CIW에서: load("skillbridge.il") 실행 필요
+    
+    try:
+        vd = VirtuosoDriver("localhost")
+    except ConnectionError as e:
+        print(e)
+        print("\n⚠️  Virtuoso에서 먼저 skillbridge 서버를 시작하세요:")
+        print('   CIW> load("/path/to/skillbridge.il")')
+        print('   CIW> pyStartServer ?id "localhost"')
+        return
+    
+    # 2. 예시: Library/Cell 지정
+    lib_name = "myLib"
+    cell_name = "myInverter"
+    
+    try:
+        # 3. 모든 Driver 찾기
+        print(f"\n{'='*60}")
+        print(f"📍 {lib_name}/{cell_name}의 모든 Driver")
+        print('='*60)
+        
+        drivers = vd.find_drivers(lib_name, cell_name)
+        
+        for d in drivers:
+            print(f"  Instance: {d.instance_name}")
+            print(f"    Cell: {d.lib_name}/{d.cell_name}")
+            print(f"    Output Pin: {d.output_pin} → Net: {d.driven_net}")
+            print()
+        
+        # 4. 특정 Net의 Driver 찾기
+        target_net = "OUT"
+        print(f"\n{'='*60}")
+        print(f"📍 Net '{target_net}'의 Driver")
+        print('='*60)
+        
+        net_drivers = vd.find_drivers_for_net(lib_name, cell_name, target_net)
+        
+        for d in net_drivers:
+            print(f"  {d.instance_name} ({d.cell_name}) → {d.output_pin}")
+        
+        # 5. 계층 구조 정보
+        print(f"\n{'='*60}")
+        print(f"📍 Cell 계층 정보")
+        print('='*60)
+        
+        info = vd.get_hierarchy_info(lib_name, cell_name)
+        
+        print(f"  Instances: {info['instance_count']}")
+        print(f"  Nets: {info['net_count']}")
+        print(f"  Ports: {info['port_count']}")
+        print(f"\n  사용된 Cell들:")
+        for cell, count in info['cell_usage'].items():
+            print(f"    {cell}: {count}개")
+        
+        # 6. 신호 경로 추적
+        print(f"\n{'='*60}")
+        print(f"📍 신호 경로 추적 (Net: {target_net})")
+        print('='*60)
+        
+        path = vd.trace_signal_path(lib_name, cell_name, target_net)
+        
+        for step in path:
+            indent = "  " * step['depth']
+            print(f"{indent}[{step['depth']}] Net: {step['net']}")
+            print(f"{indent}    Driver: {step['driver_inst']} ({step['driver_cell']})")
+        
+    except ValueError as e:
+        print(e)
+    
+    finally:
+        vd.close()
+
+
+if __name__ == "__main__":
+    main()
