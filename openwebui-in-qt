@@ -1,0 +1,73 @@
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QSplitter, 
+                             QTableWidget, QTableWidgetItem, QTextBrowser,
+                             QVBoxLayout, QWidget, QPushButton, QLineEdit)
+from PyQt5.QtCore import Qt
+import pandas as pd
+import sys
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("CSV Viewer with WebUI Info")
+        self.setGeometry(100, 100, 1400, 800)
+        
+        # Splitter로 좌우 분할
+        splitter = QSplitter(Qt.Horizontal)
+        
+        # 왼쪽: CSV 테이블
+        self.table = QTableWidget()
+        self.load_csv("your_file.csv")
+        
+        # 오른쪽: WebUI 접속 안내
+        right_widget = QWidget()
+        right_layout = QVBoxLayout()
+        
+        info_text = QTextBrowser()
+        info_text.setHtml(f"""
+        <h2>Open WebUI</h2>
+        <p><b>URL:</b> <a href="http://10.93.59.70:3000">http://10.93.59.70:3000</a></p>
+        <p>폐쇄망 환경으로 인해 여기서 직접 표시할 수 없습니다.</p>
+        <p>아래 버튼으로 기본 브라우저에서 열어주세요.</p>
+        """)
+        info_text.setOpenExternalLinks(True)
+        
+        open_button = QPushButton("외부 브라우저에서 열기")
+        open_button.clicked.connect(self.open_in_browser)
+        
+        right_layout.addWidget(info_text)
+        right_layout.addWidget(open_button)
+        right_widget.setLayout(right_layout)
+        
+        splitter.addWidget(self.table)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([700, 700])
+        
+        self.setCentralWidget(splitter)
+    
+    def load_csv(self, filename):
+        df = pd.read_csv(filename)
+        self.table.setRowCount(len(df))
+        self.table.setColumnCount(len(df.columns))
+        self.table.setHorizontalHeaderLabels(df.columns.tolist())
+        
+        for i, row in df.iterrows():
+            for j, value in enumerate(row):
+                self.table.setItem(i, j, QTableWidgetItem(str(value)))
+    
+    def open_in_browser(self):
+        import subprocess
+        try:
+            # Linux 환경에서 기본 브라우저로 열기
+            subprocess.Popen(['xdg-open', 'http://10.93.59.70:3000'])
+        except:
+            try:
+                # Firefox 직접 실행
+                subprocess.Popen(['firefox', 'http://10.93.59.70:3000'])
+            except:
+                print("브라우저를 열 수 없습니다")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
