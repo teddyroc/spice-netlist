@@ -1,73 +1,406 @@
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QSplitter, 
-                             QTableWidget, QTableWidgetItem, QTextBrowser,
-                             QVBoxLayout, QWidget, QPushButton, QLineEdit)
-from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
 import pandas as pd
+import requests
+import json
 import sys
+from datetime import datetime
+
+class MessageBubble(QWidget):
+    """채팅 말풍선"""
+    def __init__(self, text, is_user=True):
+        super().__init__()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(10, 5, 10, 5)
+        
+        bubble = QTextEdit()
+        bubble.setReadOnly(True)
+        bubble.setPlainText(text)
+        bubble.setMaximumHeight(150)
+        
+        if is_user:
+            bubble.setStyleSheet("""
+                QTextEdit {
+                    background-color: #007AFF;
+                    color: white;
+                    border-radius: 15px;
+                    padding: 10px;
+                    font-size: 14px;
+                }
+            """)
+            layout.addStretch()
+            layout.addWidget(bubble, 7)
+        else:
+            bubble.setStyleSheet("""
+                QTextEdit {
+                    background-color: #E5E5EA;
+                    color: black;
+                    border-radius: 15px;
+                    padding: 10px;
+                    font-size: 14px;
+                }
+            """)
+            layout.addWidget(bubble, 7)
+            layout.addStretch()
+        
+        self.setLayout(layout)
+
+
+class ChatWidget(QWidget):
+    """Open WebUI 스타일 채팅 위젯"""
+    def __init__(self):
+        super().__init__()
+        self.selected_data = None
+        self.conversation_history = []
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
+        layout.setSpacing(0)
+        
+        # === 헤더 ===
+        header = QWidget()
+        header.setStyleSheet("background-color: #1a1a1a; padding: 15px;")
+        header_layout = QHBoxLayout()
+        
+        title = QLabel("🤖 AI Assistant")
+        title.setStyleSheet("color: white; font-size: 18px; font-weight: bold;")
+        
+        new_chat_btn = QPushButton("+ New Chat")
+        new_chat_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #333;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #444;
+            }
+        """)
+        new_chat_btn.clicked.connect(self.new_chat)
+        
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        header_layout.addWidget(new_chat_btn)
+        header.setLayout(header_layout)
+        
+        # === 선택된 데이터 표시 영역 ===
+        self.data_banner = QWidget()
+        self.data_banner.setStyleSheet("background-color: #FFF3CD; padding: 10px; border-left: 4px solid #FFC107;")
+        data_banner_layout = QVBoxLayout()
+        
+        self.data_label = QLabel("📊 선택된 데이터 없음")
+        self.data_label.setStyleSheet("color: #856404; font-weight: bold;")
+        
+        self.data_preview = QTextEdit()
+        self.data_preview.setReadOnly(True)
+        self.data_preview.setMaximumHeight(80)
+        self.data_preview.setStyleSheet("background-color: white; border: 1px solid #ddd; border-radius: 3px;")
+        self.data_preview.hide()
+        
+        clear_data_btn = QPushButton("❌ 선택 해제")
+        clear_data_btn.setMaximumWidth(100)
+        clear_data_btn.clicked.connect(self.clear_data)
+        
+        data_banner_layout.addWidget(self.data_label)
+        data_banner_layout.addWidget(self.data_preview)
+        data_banner_layout.addWidget(clear_data_btn)
+        self.data_banner.setLayout(data_banner_layout)
+        self.data_banner.hide()
+        
+        # === 채팅 영역 (스크롤) ===
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setStyleSheet("border: none; background-color: white;")
+        
+        self.chat_container = QWidget()
+        self.chat_layout = QVBoxLayout()
+        self.chat_layout.addStretch()
+        self.chat_container.setLayout(self.chat_layout)
+        
+        scroll_area.setWidget(self.chat_container)
+        self.scroll_area = scroll_area
+        
+        # === 입력 영역 ===
+        input_widget = QWidget()
+        input_widget.setStyleSheet("background-color: #f8f9fa; padding: 15px; border-top: 1px solid #ddd;")
+        input_layout = QHBoxLayout()
+        
+        self.input_box = QTextEdit()
+        self.input_box.setPlaceholderText("메시지를 입력하세요...")
+        self.input_box.setMaximumHeight(60)
+        self.input_box.setStyleSheet("""
+            QTextEdit {
+                border: 2px solid #ddd;
+                border-radius: 20px;
+                padding: 10px;
+                font-size: 14px;
+            }
+            QTextEdit:focus {
+                border: 2px solid #007AFF;
+            }
+        """)
+        
+        self.send_btn = QPushButton("➤")
+        self.send_btn.setFixedSize(50, 50)
+        self.send_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #007AFF;
+                color: white;
+                border: none;
+                border-radius: 25px;
+                font-size: 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #0056b3;
+            }
+            QPushButton:disabled {
+                background-color: #ccc;
+            }
+        """)
+        self.send_btn.clicked.connect(self.send_message)
+        
+        input_layout.addWidget(self.input_box)
+        input_layout.addWidget(self.send_btn)
+        input_widget.setLayout(input_layout)
+        
+        # === 전체 레이아웃 ===
+        layout.addWidget(header)
+        layout.addWidget(self.data_banner)
+        layout.addWidget(scroll_area, 1)
+        layout.addWidget(input_widget)
+        
+        self.setLayout(layout)
+        
+        # 환영 메시지
+        self.add_message("안녕하세요! CSV 데이터를 선택하고 질문해주세요.", is_user=False)
+    
+    def set_selected_data(self, json_data):
+        """테이블에서 선택된 데이터 설정"""
+        self.selected_data = json_data
+        if json_data:
+            data_obj = json.loads(json_data)
+            row_count = len(data_obj)
+            
+            self.data_label.setText(f"📊 {row_count}개 행 선택됨")
+            self.data_preview.setPlainText(json_data[:200] + "...")
+            self.data_preview.show()
+            self.data_banner.show()
+            
+            self.add_message(f"✅ {row_count}개의 데이터 행이 선택되었습니다.", is_user=False)
+    
+    def clear_data(self):
+        """선택 데이터 해제"""
+        self.selected_data = None
+        self.data_banner.hide()
+        self.add_message("선택이 해제되었습니다.", is_user=False)
+    
+    def add_message(self, text, is_user=True):
+        """채팅 메시지 추가"""
+        # 마지막 stretch 제거
+        if self.chat_layout.count() > 0:
+            item = self.chat_layout.takeAt(self.chat_layout.count() - 1)
+            if item:
+                item.widget()
+        
+        bubble = MessageBubble(text, is_user)
+        self.chat_layout.addWidget(bubble)
+        self.chat_layout.addStretch()
+        
+        # 스크롤을 맨 아래로
+        QTimer.singleShot(100, lambda: self.scroll_area.verticalScrollBar().setValue(
+            self.scroll_area.verticalScrollBar().maximum()
+        ))
+    
+    def send_message(self):
+        """메시지 전송"""
+        message = self.input_box.toPlainText().strip()
+        if not message:
+            return
+        
+        # 사용자 메시지 표시
+        self.add_message(message, is_user=True)
+        self.input_box.clear()
+        self.send_btn.setEnabled(False)
+        
+        # 로딩 표시
+        self.add_message("생각 중...", is_user=False)
+        QApplication.processEvents()
+        
+        # API 호출
+        self.call_llm_api(message)
+    
+    def call_llm_api(self, message):
+        """LLM API 호출"""
+        try:
+            # 프롬프트 구성
+            if self.selected_data:
+                prompt = f"""다음은 CSV 데이터입니다:
+
+{self.selected_data}
+
+질문: {message}
+
+위 데이터를 바탕으로 답변해주세요."""
+            else:
+                prompt = message
+            
+            # Open WebUI API 호출
+            response = requests.post(
+                "http://10.93.59.70:3000/api/chat",
+                json={
+                    "model": "llama2",  # 실제 모델명으로 변경
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": False
+                },
+                timeout=60
+            )
+            
+            # 마지막 "생각 중..." 메시지 제거
+            last_widget = self.chat_layout.itemAt(self.chat_layout.count() - 2).widget()
+            if last_widget:
+                last_widget.deleteLater()
+            
+            if response.status_code == 200:
+                result = response.json()
+                answer = result.get('message', {}).get('content', '응답을 받을 수 없습니다.')
+                self.add_message(answer, is_user=False)
+            else:
+                self.add_message(f"오류: API 응답 코드 {response.status_code}", is_user=False)
+                
+        except Exception as e:
+            # 마지막 "생각 중..." 메시지 제거
+            last_widget = self.chat_layout.itemAt(self.chat_layout.count() - 2).widget()
+            if last_widget:
+                last_widget.deleteLater()
+            
+            self.add_message(f"오류 발생: {str(e)}", is_user=False)
+        
+        finally:
+            self.send_btn.setEnabled(True)
+    
+    def new_chat(self):
+        """새 채팅 시작"""
+        # 모든 메시지 제거
+        while self.chat_layout.count() > 1:
+            item = self.chat_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        self.conversation_history = []
+        self.add_message("새 대화가 시작되었습니다.", is_user=False)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("CSV Viewer with WebUI Info")
-        self.setGeometry(100, 100, 1400, 800)
+        self.setWindowTitle("CSV Analyzer with AI")
+        self.setGeometry(100, 100, 1600, 900)
         
-        # Splitter로 좌우 분할
+        # 메인 스플리터
         splitter = QSplitter(Qt.Horizontal)
         
-        # 왼쪽: CSV 테이블
+        # === 왼쪽: CSV 테이블 ===
+        left_widget = QWidget()
+        left_layout = QVBoxLayout()
+        
+        # 헤더
+        table_header = QLabel("📄 CSV 데이터")
+        table_header.setStyleSheet("font-size: 16px; font-weight: bold; padding: 10px;")
+        
         self.table = QTableWidget()
-        self.load_csv("your_file.csv")
+        self.table.setSelectionMode(QTableWidget.ContiguousSelection)
         
-        # 오른쪽: WebUI 접속 안내
-        right_widget = QWidget()
-        right_layout = QVBoxLayout()
-        
-        info_text = QTextBrowser()
-        info_text.setHtml(f"""
-        <h2>Open WebUI</h2>
-        <p><b>URL:</b> <a href="http://10.93.59.70:3000">http://10.93.59.70:3000</a></p>
-        <p>폐쇄망 환경으로 인해 여기서 직접 표시할 수 없습니다.</p>
-        <p>아래 버튼으로 기본 브라우저에서 열어주세요.</p>
+        analyze_btn = QPushButton("선택한 데이터 분석하기")
+        analyze_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                border: none;
+                padding: 10px;
+                font-size: 14px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
         """)
-        info_text.setOpenExternalLinks(True)
+        analyze_btn.clicked.connect(self.analyze_selected)
         
-        open_button = QPushButton("외부 브라우저에서 열기")
-        open_button.clicked.connect(self.open_in_browser)
+        left_layout.addWidget(table_header)
+        left_layout.addWidget(self.table)
+        left_layout.addWidget(analyze_btn)
+        left_widget.setLayout(left_layout)
         
-        right_layout.addWidget(info_text)
-        right_layout.addWidget(open_button)
-        right_widget.setLayout(right_layout)
+        # === 오른쪽: 채팅 위젯 ===
+        self.chat_widget = ChatWidget()
         
-        splitter.addWidget(self.table)
-        splitter.addWidget(right_widget)
-        splitter.setSizes([700, 700])
+        splitter.addWidget(left_widget)
+        splitter.addWidget(self.chat_widget)
+        splitter.setSizes([800, 800])
         
         self.setCentralWidget(splitter)
+        
+        # CSV 로드
+        self.load_csv("data.csv")
     
     def load_csv(self, filename):
-        df = pd.read_csv(filename)
-        self.table.setRowCount(len(df))
-        self.table.setColumnCount(len(df.columns))
-        self.table.setHorizontalHeaderLabels(df.columns.tolist())
-        
-        for i, row in df.iterrows():
-            for j, value in enumerate(row):
-                self.table.setItem(i, j, QTableWidgetItem(str(value)))
-    
-    def open_in_browser(self):
-        import subprocess
+        """CSV 파일 로드"""
         try:
-            # Linux 환경에서 기본 브라우저로 열기
-            subprocess.Popen(['xdg-open', 'http://10.93.59.70:3000'])
-        except:
-            try:
-                # Firefox 직접 실행
-                subprocess.Popen(['firefox', 'http://10.93.59.70:3000'])
-            except:
-                print("브라우저를 열 수 없습니다")
+            df = pd.read_csv(filename)
+            self.df = df
+            
+            self.table.setRowCount(len(df))
+            self.table.setColumnCount(len(df.columns))
+            self.table.setHorizontalHeaderLabels(df.columns.tolist())
+            
+            for i, row in df.iterrows():
+                for j, value in enumerate(row):
+                    self.table.setItem(i, j, QTableWidgetItem(str(value)))
+            
+            self.table.resizeColumnsToContents()
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"CSV 로드 실패: {str(e)}")
+    
+    def analyze_selected(self):
+        """선택된 데이터를 JSON으로 변환하여 채팅 위젯에 전달"""
+        selected = self.table.selectedRanges()
+        if not selected:
+            QMessageBox.warning(self, "경고", "데이터를 먼저 선택해주세요!")
+            return
+        
+        range_item = selected[0]
+        data = []
+        
+        # 헤더
+        headers = [
+            self.table.horizontalHeaderItem(col).text()
+            for col in range(range_item.leftColumn(), range_item.rightColumn() + 1)
+        ]
+        
+        # 데이터
+        for row in range(range_item.topRow(), range_item.bottomRow() + 1):
+            row_dict = {}
+            for idx, col in enumerate(range(range_item.leftColumn(), range_item.rightColumn() + 1)):
+                item = self.table.item(row, col)
+                row_dict[headers[idx]] = item.text() if item else ""
+            data.append(row_dict)
+        
+        json_data = json.dumps(data, ensure_ascii=False, indent=2)
+        self.chat_widget.set_selected_data(json_data)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    # 폰트 설정
+    font = QFont("맑은 고딕", 10)
+    app.setFont(font)
+    
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
