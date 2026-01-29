@@ -1,0 +1,686 @@
+"""
+virtuoso_api.py - Clean Virtuoso API
+====================================
+
+사용자 친화적인 Virtuoso 자동화 API
+
+핵심 설계 원칙:
+- 포트 관리는 완전 자동 (사용자는 신경 쓸 필요 없음)
+- 다중 세션 지원
+- Virtuoso 시작부터 SKILL 서버 연결까지 원클릭
+
+사용 예시:
+---------
+>>> from virtuoso_api import Virtuoso
+>>> 
+>>> # 가장 간단한 사용법
+>>> with Virtuoso() as vs:
+...     vs("geGetEditCellView()")
+...
+>>> # 다중 세션
+>>> v1 = Virtuoso.open()
+>>> v2 = Virtuoso.open()
+>>> v1("geOpen(...)")
+>>> v2("leOpen(...)")
+>>> Virtuoso.close_all()
+"""
+
+from __future__ import annotations
+import socket
+import subprocess
+import time
+import os
+import signal
+import tempfile
+import threading
+import shutil
+import atexit
+from typing import Optional, Dict, Any, List, TypeVar, Generic
+from dataclasses import dataclass, field
+from contextlib import contextmanager
+from pathlib import Path
+import logging
+
+__all__ = ['Virtuoso', 'VirtuosoError', 'ConnectionError', 'StartupError']
+
+# 로깅
+_logger = logging.getLogger(__name__)
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter('[Virtuoso] %(message)s'))
+_logger.addHandler(_handler)
+_logger.setLevel(logging.INFO)
+
+
+# ============================================================================
+# Exceptions
+# ============================================================================
+
+class VirtuosoError(Exception):
+    """Virtuoso 관련 기본 예외"""
+    pass
+
+
+class ConnectionError(VirtuosoError):
+    """연결 실패 예외"""
+    pass
+
+
+class StartupError(VirtuosoError):
+    """시작 실패 예외"""
+    pass
+
+
+# ============================================================================
+# Internal Port Manager
+# ============================================================================
+
+class _PortManager:
+    """내부 포트 관리자 - 사용자에게 노출되지 않음"""
+    
+    _range = (6000, 7000)
+    _used: set = set()
+    _lock = threading.Lock()
+    
+    @classmethod
+    def acquire(cls) -> int:
+        with cls._lock:
+            for port in range(cls._range[0], cls._range[1]):
+                if port not in cls._used and cls._check(port):
+                    cls._used.add(port)
+                    return port
+        raise VirtuosoError(f"No available ports in {cls._range}")
+    
+    @classmethod
+    def release(cls, port: int):
+        with cls._lock:
+            cls._used.discard(port)
+    
+    @classmethod
+    def _check(cls, port: int) -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(('localhost', port))
+                return True
+        except OSError:
+            return False
+    
+    @classmethod
+    def wait_ready(cls, port: int, timeout: float = 30) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(1)
+                    s.connect(('localhost', port))
+                    return True
+            except:
+                time.sleep(0.5)
+        return False
+
+
+# ============================================================================
+# Main Virtuoso Class
+# ============================================================================
+
+class Virtuoso:
+    """
+    Virtuoso 세션 관리 클래스
+    
+    포트는 자동으로 관리되며, 사용자는 신경 쓸 필요가 없습니다.
+    
+    Examples
+    --------
+    >>> # Context manager (권장)
+    >>> with Virtuoso() as vs:
+    ...     result = vs("geGetEditCellView()")
+    ...     print(result)
+    
+    >>> # 직접 관리
+    >>> vs = Virtuoso.open()
+    >>> vs("printf('hello')")
+    >>> vs.close()
+    
+    >>> # 다중 세션
+    >>> v1 = Virtuoso.open()
+    >>> v2 = Virtuoso.open()
+    >>> v1("geOpen(...)")
+    >>> v2("leOpen(...)")
+    >>> Virtuoso.close_all()
+    
+    >>> # 기존 Virtuoso에 연결 (이미 SKILL 서버가 실행 중인 경우)
+    >>> vs = Virtuoso.connect(6000)
+    """
+    
+    # ===== Class-level Configuration =====
+    # 이 값들은 클래스 수준에서 변경 가능
+    conda_env: str = "/spot/dsdesign/DVQ/CONDA_ENVS/py311_JK"
+    virtuoso_cmd: str = "vt618"
+    skill_server_path: str = "~/python_server.il"
+    timeout: int = 60
+    startup_wait: float = 3.0
+    
+    # Session tracking
+    _all_sessions: Dict[int, 'Virtuoso'] = {}
+    _session_lock = threading.Lock()
+    _counter = 0
+    
+    def __init__(self):
+        """내부 생성자 - open() 또는 connect() 사용 권장"""
+        self._id: int = 0
+        self._port: int = 0
+        self._ws: Any = None
+        self._process: Optional[subprocess.Popen] = None
+        self._temp_dir: Optional[str] = None
+        self._connected: bool = False
+    
+    # ===== Factory Methods =====
+    
+    @classmethod
+    def open(
+        cls,
+        work_dir: str = None,
+        *,
+        conda_env: str = None,
+        virtuoso_cmd: str = None,
+        skill_server: str = None,
+    ) -> 'Virtuoso':
+        """
+        새 Virtuoso 세션 시작
+        
+        Parameters
+        ----------
+        work_dir : str, optional
+            작업 디렉토리 (기본: 현재 디렉토리)
+        conda_env : str, optional
+            Conda 환경 경로
+        virtuoso_cmd : str, optional
+            Virtuoso 실행 명령어
+        skill_server : str, optional
+            SKILL 서버 스크립트 경로
+        
+        Returns
+        -------
+        Virtuoso
+            연결된 Virtuoso 세션
+        
+        Examples
+        --------
+        >>> vs = Virtuoso.open()
+        >>> vs = Virtuoso.open("/path/to/work/dir")
+        >>> vs = Virtuoso.open(virtuoso_cmd="virtuoso_custom")
+        """
+        instance = cls()
+        
+        # 설정 오버라이드
+        if conda_env:
+            instance.conda_env = conda_env
+        if virtuoso_cmd:
+            instance.virtuoso_cmd = virtuoso_cmd
+        if skill_server:
+            instance.skill_server_path = skill_server
+        
+        instance._start(work_dir or os.getcwd())
+        return instance
+    
+    @classmethod
+    def connect(cls, port: int) -> 'Virtuoso':
+        """
+        기존에 실행 중인 Virtuoso에 연결
+        
+        이미 SKILL 서버가 실행 중인 Virtuoso에 연결할 때 사용합니다.
+        
+        Parameters
+        ----------
+        port : int
+            SKILL 서버가 리스닝하는 포트 번호
+        
+        Returns
+        -------
+        Virtuoso
+            연결된 Virtuoso 세션
+        
+        Examples
+        --------
+        >>> # 먼저 Virtuoso CIW에서:
+        >>> # load("~/python_server.il")
+        >>> # pyStartServer(?portNumber 6000 ?id "localhost")
+        >>> 
+        >>> vs = Virtuoso.connect(6000)
+        >>> vs("geGetEditCellView()")
+        """
+        instance = cls()
+        instance._connect_existing(port)
+        return instance
+    
+    # ===== Session Management =====
+    
+    @classmethod
+    def close_all(cls):
+        """모든 Virtuoso 세션 종료"""
+        with cls._session_lock:
+            sessions = list(cls._all_sessions.values())
+        
+        for session in sessions:
+            try:
+                session.close()
+            except Exception as e:
+                _logger.warning(f"Error closing session: {e}")
+    
+    @classmethod
+    def list_sessions(cls) -> List['Virtuoso']:
+        """활성 세션 목록 반환"""
+        with cls._session_lock:
+            return list(cls._all_sessions.values())
+    
+    @classmethod
+    def configure(
+        cls,
+        *,
+        conda_env: str = None,
+        virtuoso_cmd: str = None,
+        skill_server: str = None,
+        timeout: int = None,
+    ):
+        """
+        전역 설정 변경
+        
+        Parameters
+        ----------
+        conda_env : str
+            Conda 환경 경로
+        virtuoso_cmd : str
+            Virtuoso 실행 명령어
+        skill_server : str
+            SKILL 서버 스크립트 경로
+        timeout : int
+            연결 타임아웃 (초)
+        
+        Examples
+        --------
+        >>> Virtuoso.configure(
+        ...     conda_env="/my/conda/env",
+        ...     virtuoso_cmd="virtuoso_icadv",
+        ...     timeout=120,
+        ... )
+        """
+        if conda_env:
+            cls.conda_env = conda_env
+        if virtuoso_cmd:
+            cls.virtuoso_cmd = virtuoso_cmd
+        if skill_server:
+            cls.skill_server_path = skill_server
+        if timeout:
+            cls.timeout = timeout
+    
+    # ===== SKILL Execution =====
+    
+    def __call__(self, skill_code: str) -> Any:
+        """
+        SKILL 코드 실행 (가장 간편한 방법)
+        
+        Parameters
+        ----------
+        skill_code : str
+            실행할 SKILL 코드
+        
+        Returns
+        -------
+        Any
+            SKILL 실행 결과
+        
+        Examples
+        --------
+        >>> vs("geGetEditCellView()")
+        >>> vs("dbOpenCellViewByType('myLib' 'myCell' 'schematic')")
+        """
+        self._ensure_connected()
+        return self._ws['evalstring'](skill_code)
+    
+    def execute(self, skill_code: str) -> Any:
+        """__call__의 명시적 버전"""
+        return self(skill_code)
+    
+    def eval(self, skill_code: str) -> Any:
+        """__call__의 별칭"""
+        return self(skill_code)
+    
+    def __getitem__(self, func_name: str):
+        """
+        SKILL 함수 직접 호출
+        
+        Examples
+        --------
+        >>> vs['dbOpenCellViewByType']('lib', 'cell', 'view')
+        >>> vs['geGetEditCellView']()
+        """
+        self._ensure_connected()
+        return self._ws[func_name]
+    
+    @property
+    def ws(self):
+        """Skillbridge Workspace 객체 직접 접근"""
+        self._ensure_connected()
+        return self._ws
+    
+    # ===== State Properties =====
+    
+    @property
+    def port(self) -> int:
+        """할당된 포트 번호"""
+        return self._port
+    
+    @property
+    def session_id(self) -> int:
+        """세션 ID"""
+        return self._id
+    
+    @property
+    def is_connected(self) -> bool:
+        """연결 상태"""
+        if not self._connected:
+            return False
+        try:
+            self._ws['evalstring']('t')
+            return True
+        except:
+            return False
+    
+    # ===== Lifecycle =====
+    
+    def close(self):
+        """세션 종료"""
+        if not self._connected:
+            return
+        
+        _logger.info(f"Session {self._id}: Closing...")
+        self._connected = False
+        
+        # 세션 목록에서 제거
+        with self._session_lock:
+            self._all_sessions.pop(self._id, None)
+        
+        # Workspace 닫기
+        if self._ws:
+            try:
+                self._ws.close()
+            except:
+                pass
+            self._ws = None
+        
+        # 프로세스 종료
+        if self._process:
+            try:
+                os.killpg(os.getpgid(self._process.pid), signal.SIGTERM)
+                self._process.wait(timeout=5)
+            except:
+                try:
+                    os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+                except:
+                    pass
+            self._process = None
+        
+        # 포트 해제
+        if self._port:
+            _PortManager.release(self._port)
+            self._port = 0
+        
+        # 임시 디렉토리 정리
+        if self._temp_dir:
+            try:
+                shutil.rmtree(self._temp_dir, ignore_errors=True)
+            except:
+                pass
+            self._temp_dir = None
+        
+        _logger.info(f"Session {self._id}: Closed")
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, *args):
+        self.close()
+        return False
+    
+    def __del__(self):
+        self.close()
+    
+    def __repr__(self):
+        status = "connected" if self.is_connected else "disconnected"
+        return f"Virtuoso(id={self._id}, port={self._port}, {status})"
+    
+    # ===== Internal Methods =====
+    
+    def _start(self, work_dir: str):
+        """Virtuoso 시작 및 연결"""
+        
+        # 세션 ID 할당
+        with self._session_lock:
+            Virtuoso._counter += 1
+            self._id = Virtuoso._counter
+        
+        # 포트 할당
+        self._port = _PortManager.acquire()
+        _logger.info(f"Session {self._id}: Allocated port {self._port}")
+        
+        try:
+            # 임시 디렉토리 및 cdsinit 생성
+            self._temp_dir = tempfile.mkdtemp(prefix=f"virtuoso_{self._id}_")
+            self._create_cdsinit(work_dir)
+            
+            # Virtuoso 실행
+            self._launch_virtuoso()
+            
+            _logger.info(f"Session {self._id}: Waiting for startup...")
+            time.sleep(self.startup_wait)
+            
+            # 서버 대기
+            if not _PortManager.wait_ready(self._port, self.timeout - self.startup_wait):
+                raise StartupError(f"SKILL server did not start on port {self._port}")
+            
+            # Skillbridge 연결
+            self._connect_skillbridge()
+            
+            # 세션 등록
+            with self._session_lock:
+                self._all_sessions[self._id] = self
+            
+            _logger.info(f"Session {self._id}: ✓ Ready!")
+            
+        except Exception as e:
+            self._cleanup_on_error()
+            raise StartupError(str(e)) from e
+    
+    def _connect_existing(self, port: int):
+        """기존 Virtuoso에 연결"""
+        with self._session_lock:
+            Virtuoso._counter += 1
+            self._id = Virtuoso._counter
+        
+        self._port = port
+        _logger.info(f"Session {self._id}: Connecting to port {port}...")
+        
+        try:
+            self._connect_skillbridge()
+            
+            with self._session_lock:
+                self._all_sessions[self._id] = self
+            
+            _logger.info(f"Session {self._id}: ✓ Connected!")
+            
+        except Exception as e:
+            raise ConnectionError(f"Failed to connect to port {port}: {e}") from e
+    
+    def _create_cdsinit(self, work_dir: str):
+        """cdsinit 파일 생성"""
+        skill_path = os.path.expanduser(self.skill_server_path)
+        
+        content = f'''
+; Auto-generated for session {self._id}
+printf("\\n[Session {self._id}] Starting SKILL server on port {self._port}...\\n")
+if(isFile("{skill_path}") then
+    load("{skill_path}")
+    pyStartServer(?portNumber {self._port} ?id "localhost")
+    printf("[Session {self._id}] Server ready on port {self._port}\\n")
+else
+    printf("[Session {self._id}] ERROR: {skill_path} not found!\\n")
+)
+'''
+        
+        # 기존 cdsinit 포함
+        orig = os.path.join(work_dir, ".cdsinit")
+        if os.path.exists(orig):
+            with open(orig) as f:
+                content = f.read() + "\n" + content
+        
+        # cds.lib 복사
+        cdslib = os.path.join(work_dir, "cds.lib")
+        if os.path.exists(cdslib):
+            shutil.copy(cdslib, self._temp_dir)
+        
+        with open(os.path.join(self._temp_dir, ".cdsinit"), 'w') as f:
+            f.write(content)
+    
+    def _launch_virtuoso(self):
+        """Virtuoso 프로세스 실행"""
+        cmd = f'''
+source ~/.bashrc 2>/dev/null || true
+conda activate {self.conda_env} 2>/dev/null || true
+cd {self._temp_dir}
+{self.virtuoso_cmd}
+'''
+        self._process = subprocess.Popen(
+            cmd, shell=True, executable='/bin/bash',
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            preexec_fn=os.setsid, env={**os.environ}
+        )
+        _logger.info(f"Session {self._id}: Process started (PID: {self._process.pid})")
+    
+    def _connect_skillbridge(self):
+        """Skillbridge 연결"""
+        try:
+            from skillbridge import Workspace
+        except ImportError:
+            raise ImportError("skillbridge required: pip install skillbridge")
+        
+        end_time = time.time() + self.timeout
+        last_err = None
+        
+        while time.time() < end_time:
+            try:
+                self._ws = Workspace.open(f"localhost:{self._port}")
+                self._ws['evalstring']('t')  # 테스트
+                self._connected = True
+                return
+            except Exception as e:
+                last_err = e
+                time.sleep(1)
+        
+        raise ConnectionError(f"Connection timeout: {last_err}")
+    
+    def _cleanup_on_error(self):
+        """에러 발생 시 정리"""
+        if self._port:
+            _PortManager.release(self._port)
+        if self._process:
+            try:
+                os.killpg(os.getpgid(self._process.pid), signal.SIGKILL)
+            except:
+                pass
+        if self._temp_dir:
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+    
+    def _ensure_connected(self):
+        """연결 상태 확인"""
+        if not self._connected:
+            raise VirtuosoError("Session not connected")
+
+
+# 프로그램 종료 시 자동 정리
+atexit.register(Virtuoso.close_all)
+
+
+# ============================================================================
+# Convenience Functions (모듈 레벨)
+# ============================================================================
+
+def open_virtuoso(**kwargs) -> Virtuoso:
+    """Virtuoso.open()의 별칭"""
+    return Virtuoso.open(**kwargs)
+
+
+def connect_virtuoso(port: int) -> Virtuoso:
+    """Virtuoso.connect()의 별칭"""
+    return Virtuoso.connect(port)
+
+
+# ============================================================================
+# CLI / Demo
+# ============================================================================
+
+if __name__ == "__main__":
+    print("""
+╔═══════════════════════════════════════════════════════════════════╗
+║                 Virtuoso API - Quick Reference                    ║
+╚═══════════════════════════════════════════════════════════════════╝
+
+┌─ 설치 ─────────────────────────────────────────────────────────────┐
+│  pip install skillbridge                                           │
+└────────────────────────────────────────────────────────────────────┘
+
+┌─ 기본 사용법 ──────────────────────────────────────────────────────┐
+│                                                                    │
+│  from virtuoso_api import Virtuoso                                 │
+│                                                                    │
+│  # Context manager (가장 안전)                                     │
+│  with Virtuoso.open() as vs:                                       │
+│      result = vs("geGetEditCellView()")                           │
+│      print(result)                                                │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+┌─ 다중 세션 ────────────────────────────────────────────────────────┐
+│                                                                    │
+│  sch = Virtuoso.open()  # 자동으로 포트 할당                       │
+│  lay = Virtuoso.open()  # 두 번째 세션, 다른 포트                  │
+│                                                                    │
+│  sch("geOpen(...)")     # 스케매틱 작업                            │
+│  lay("leOpen(...)")     # 레이아웃 작업 (동시에!)                  │
+│                                                                    │
+│  Virtuoso.close_all()   # 모두 정리                                │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+┌─ 기존 Virtuoso 연결 ───────────────────────────────────────────────┐
+│                                                                    │
+│  # 이미 실행 중인 Virtuoso에 연결                                  │
+│  # (SKILL 서버가 이미 시작되어 있어야 함)                          │
+│  vs = Virtuoso.connect(6000)                                       │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+┌─ 환경 설정 ────────────────────────────────────────────────────────┐
+│                                                                    │
+│  # 전역 설정                                                       │
+│  Virtuoso.configure(                                               │
+│      conda_env="/path/to/env",                                     │
+│      virtuoso_cmd="virtuoso_custom",                               │
+│      skill_server="~/my_server.il",                                │
+│      timeout=120                                                   │
+│  )                                                                 │
+│                                                                    │
+│  # 또는 개별 세션 설정                                             │
+│  vs = Virtuoso.open(conda_env="/other/env")                        │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+┌─ SKILL 실행 방법들 ────────────────────────────────────────────────┐
+│                                                                    │
+│  vs("code")           # 가장 간단                                  │
+│  vs.execute("code")   # 명시적                                     │
+│  vs.eval("code")      # 별칭                                       │
+│  vs['funcName'](...)  # 함수 직접 호출                             │
+│  vs.ws.db.xxx()       # Skillbridge 직접 사용                      │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+""")
